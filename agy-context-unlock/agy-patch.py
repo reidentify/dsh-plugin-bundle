@@ -61,6 +61,7 @@ Usage:
 
 import argparse
 import hashlib
+import io
 import os
 import plistlib
 import re
@@ -69,6 +70,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import zipfile
+import zlib
 
 PCLNTAB_MAGIC = 0xFFFFFFF1
 ENV_NAME = b"AGY_CLI_AUTO_COMPACT_OVERRIDE"
@@ -82,6 +85,22 @@ FUNC_SELECT_EXP_KEY = "config.selectCheckpointExperimentKey"
 FUNC_MAX_STEP_TOKENS = "chatconverters.(*TrajectoryChatConverter).getMaxTokensForStep"
 FUNC_ONEHARNESS_STEP = "serializers.DefaultSerializer.stepToMessage"
 FUNC_OVERRIDE = "store.AutoCompactOverride"
+FUNC_HUB_WEB_BUNDLE = "agy_hub_web_bundle.GetFS"
+
+TARGET_SYMBOLS = (
+    FUNC_OFFERS,
+    FUNC_STORE_CW,
+    FUNC_STORE_CHOICE,
+    FUNC_CHECKPOINT,
+    FUNC_EXP_CHECKPOINT,
+    FUNC_SELECT_EXP_KEY,
+    FUNC_MAX_STEP_TOKENS,
+    FUNC_ONEHARNESS_STEP,
+    FUNC_OVERRIDE,
+    FUNC_HUB_WEB_BUNDLE,
+    "strings.TrimSpace",
+    "os.Getenv",
+)
 
 NOP_ARM64 = struct.pack("<I", 0xD503201F)
 RET_TRUE_ARM64 = struct.pack("<II", 0x52800020, 0xD65F03C0)      # mov w0,#1 ; ret
@@ -305,58 +324,287 @@ def _pe_text(data):
 # Go .gopclntab symbol resolution
 # --------------------------------------------------------------------------
 
+def _pclntab_section_hint(data):
+    """Return a file-offset hint for .rdata / __gopclntab / .gopclntab to skip .text."""
+    if data[:2] == b"MZ":
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if pe + 24 <= len(data) and data[pe:pe + 4] == b"PE\0\0":
+            nsec = struct.unpack_from("<H", data, pe + 6)[0]
+            opt_size = struct.unpack_from("<H", data, pe + 20)[0]
+            sect = pe + 24 + opt_size
+            for _ in range(nsec):
+                if sect + 40 > len(data):
+                    break
+                if data[sect:sect + 8].rstrip(b"\0") == b".rdata":
+                    return struct.unpack_from("<I", data, sect + 20)[0]
+                sect += 40
+    elif data[:4] == b"\xcf\xfa\xed\xfe":
+        ncmds = struct.unpack_from("<I", data, 16)[0]
+        off = 32
+        for _ in range(ncmds):
+            if off + 8 > len(data):
+                break
+            cmd, size = struct.unpack_from("<II", data, off)
+            if cmd == 0x19 and off + 72 <= len(data):  # LC_SEGMENT_64
+                nsects = struct.unpack_from("<I", data, off + 64)[0]
+                sect = off + 72
+                for _ in range(nsects):
+                    if sect + 80 > len(data):
+                        break
+                    if data[sect:sect + 16].rstrip(b"\0") == b"__gopclntab":
+                        return struct.unpack_from("<I", data, sect + 48)[0]
+                    sect += 80
+            off += size
+    elif data[:4] == b"\x7fELF" and len(data) >= 64 and data[4] == 2 and data[5] == 1:
+        shoff = struct.unpack_from("<Q", data, 40)[0]
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 58)
+        if shoff and shstrndx < shnum and shoff + shnum * shentsize <= len(data):
+            strtab = struct.unpack_from("<Q", data, shoff + shstrndx * shentsize + 24)[0]
+            for idx in range(shnum):
+                sh = shoff + idx * shentsize
+                noff = struct.unpack_from("<I", data, sh)[0]
+                end = data.find(b"\0", strtab + noff, strtab + noff + 32)
+                if end > 0 and data[strtab + noff:end] in (b".gopclntab", b".data.rel.ro.gopclntab"):
+                    return struct.unpack_from("<Q", data, sh + 24)[0]
+    return 0
+
+
 def find_pclntab(data):
     magic = struct.pack("<I", PCLNTAB_MAGIC) + b"\x00\x00"
-    pos = 0
-    while True:
-        i = data.find(magic, pos)
-        if i < 0:
-            raise PatchError("Go pclntab not found")
-        pos = i + 1
-        # minLC is 1 on x86-64, 2 on s390x, 4 on arm64; ptrSize is 8 on 64-bit
-        if data[i + 6] not in (1, 2, 4) or data[i + 7] != 8:
-            continue
-        nfunc = struct.unpack_from("<Q", data, i + 8)[0]
-        if not 1000 < nfunc < 5_000_000:
-            continue
-        fn_off = struct.unpack_from("<Q", data, i + 32)[0]
-        if i + fn_off + 16 > len(data):
-            continue
-        head = data[i + fn_off:i + fn_off + 16]
-        if not head or not all(0x20 <= c < 0x7F or c == 0 for c in head):
-            continue
-        return i, nfunc
+    hint = _pclntab_section_hint(data)
+    for start in ((hint, 0) if 0 < hint < len(data) else (0,)):
+        pos = start
+        while True:
+            i = data.find(magic, pos)
+            if i < 0:
+                break
+            pos = i + 1
+            # minLC is 1 on x86-64, 2 on s390x, 4 on arm64; ptrSize is 8 on 64-bit
+            if i + 72 > len(data) or data[i + 6] not in (1, 2, 4) or data[i + 7] != 8:
+                continue
+            nfunc = struct.unpack_from("<Q", data, i + 8)[0]
+            if not 1000 < nfunc < 5_000_000:
+                continue
+            fn_off = struct.unpack_from("<Q", data, i + 32)[0]
+            if i + fn_off + 16 > len(data):
+                continue
+            head = data[i + fn_off:i + fn_off + 16]
+            if not head or not all(0x20 <= c < 0x7F or c == 0 for c in head):
+                continue
+            return i, nfunc
+    raise PatchError("Go pclntab not found")
 
 
-def build_functions(data):
-    """Map trailing Go func name -> (entryoff, size)."""
+def build_functions(data, target_names=None):
+    """Map trailing Go func name -> (entryoff, size).
+
+    When `target_names` is provided, resolves only those symbols via C-level
+    `funcnametab` searches + `ftab` binary search (~15 ms instead of ~350 ms).
+    Pass `target_names=None` for the full symbol map.
+    """
     base, nfunc = find_pclntab(data)
-    fnstart = base + struct.unpack_from("<Q", data, base + 32)[0]
-    pcln = base + struct.unpack_from("<Q", data, base + 64)[0]
+    fn_off, cu_off, file_off, pc_off, pcln_off = struct.unpack_from("<5Q", data, base + 32)
+    fnstart = base + fn_off
+    fnend = base + cu_off if 0 < fn_off < cu_off and base + cu_off <= len(data) else len(data)
+    pcln = base + pcln_off
 
-    funcs = {}
-    for i in range(nfunc):
-        off = pcln + i * 8
-        if off + 16 > len(data):
+    if not target_names:
+        funcs = {}
+        for i in range(nfunc):
+            off = pcln + i * 8
+            if off + 16 > len(data):
+                break
+            entryoff, funcoff, next_entryoff = struct.unpack_from("<III", data, off)
+            rec = pcln + funcoff
+            if rec + 8 > len(data):
+                continue
+            nameoff = struct.unpack_from("<i", data, rec + 4)[0]
+            start = fnstart + nameoff
+            end = data.find(b"\x00", start, start + 1024)
+            if end < 0:
+                continue
+            try:
+                name = data[start:end].decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            funcs.setdefault(name.rsplit("/", 1)[-1], (entryoff, max(0, next_entryoff - entryoff)))
+        if not funcs:
+            raise PatchError("functab produced no symbols")
+        return funcs
+
+    filestart, fileend = base + file_off, base + pc_off
+    has_filetab = (
+        0 < cu_off < file_off < pc_off
+        and base + pc_off <= len(data)
+        and fileend - filestart >= 4096
+    )
+
+    by_pkg = {}
+    for sym in set(target_names):
+        pkg = sym.split(".", 1)[0] if "." in sym else ""
+        by_pkg.setdefault(pkg, []).append(sym)
+
+    u32 = struct.Struct("<I").unpack_from
+    i32 = struct.Struct("<i").unpack_from
+    u32_pair = struct.Struct("<II").unpack_from
+
+    wanted_pkgs_b = {pk.encode("ascii"): pk for pk in by_pkg if pk}
+    pkg_centers = {pk: [] for pk in by_pkg}
+    for idx in range(0, nfunc, 96):
+        off = pcln + idx * 8
+        if off + 8 > len(data):
             break
-        entryoff, funcoff = struct.unpack_from("<II", data, off)
-        next_entryoff = struct.unpack_from("<I", data, off + 8)[0]
-        rec = pcln + funcoff
-        if rec + 8 > len(data):
+        foff = u32(data, off + 4)[0]
+        if pcln + foff + 8 > len(data):
             continue
-        nameoff = struct.unpack_from("<i", data, rec + 4)[0]
-        start = fnstart + nameoff
-        end = data.find(b"\x00", start, start + 1024)
+        noff = i32(data, pcln + foff + 4)[0]
+        s = fnstart + noff
+        if not fnstart <= s < fnend:
+            continue
+        end = data.find(b"\x00", s, min(fnend, s + 256))
         if end < 0:
             continue
-        try:
-            name = data[start:end].decode("ascii")
-        except UnicodeDecodeError:
-            continue
-        size = max(0, next_entryoff - entryoff)
-        funcs.setdefault(name.rsplit("/", 1)[-1], (entryoff, size))
-    if not funcs:
-        raise PatchError("functab produced no symbols")
+        slash = data.rfind(b"/", s, end)
+        p_start = (slash + 1) if slash >= s else s
+        dot = data.find(b".", p_start, end)
+        if dot > p_start:
+            pk_b = bytes(data[p_start:dot])
+            if pk_b in wanted_pkgs_b:
+                pkg_centers[wanted_pkgs_b[pk_b]].append(s)
+
+    wanted_nameoffs = {}
+
+    def _scan_sym(sym, ranges):
+        needle = sym.encode("ascii")
+        nlen = len(needle)
+        found = False
+        for s_lo, s_hi in ranges:
+            pos = s_lo
+            while True:
+                hit = data.find(needle, pos, s_hi)
+                if hit < 0:
+                    break
+                end_idx = hit + nlen
+                if end_idx < fnend and data[end_idx] == 0 and (hit == fnstart or data[hit - 1] in (0, 0x2F)):
+                    if hit > fnstart and data[hit - 1] == 0x2F:
+                        prev_nul = data.rfind(b"\x00", fnstart, hit)
+                        full_start = (prev_nul + 1) if prev_nul >= fnstart else fnstart
+                    else:
+                        full_start = hit
+                    wanted_nameoffs[full_start - fnstart] = sym
+                    found = True
+                pos = hit + 1
+            if found:
+                return True
+        return False
+
+    for pkg, syms in by_pkg.items():
+        if has_filetab and pkg and pkg != "main":
+            fneedle = b"/" + pkg.encode("ascii") + b"/"
+            pkg_dirs = set()
+            fpos = filestart
+            while True:
+                fhit = data.find(fneedle, fpos, fileend)
+                if fhit < 0:
+                    break
+                fend = data.find(b"\x00", fhit, fileend)
+                if fend < 0:
+                    break
+                fpos = fend + 1
+                if data.find(b"/", fhit + len(fneedle), fend) < 0:
+                    fnul = data.rfind(b"\x00", filestart, fhit)
+                    f_start = (fnul + 1) if fnul >= filestart else filestart
+                    pkg_dirs.add(bytes(data[f_start:fhit + len(fneedle)]))
+            if not pkg_dirs:
+                continue
+        else:
+            pkg_dirs = None
+
+        wins = []
+        for c in pkg_centers.get(pkg, ()):
+            lo, hi = max(fnstart, c - 0x18000), min(fnend, c + 0x18000)
+            if wins and lo <= wins[-1][1]:
+                wins[-1] = (wins[-1][0], max(wins[-1][1], hi))
+            else:
+                wins.append((lo, hi))
+
+        need_fallback = (pkg_dirs is None) or (len(wins) < len(pkg_dirs))
+        syms.sort(key=len, reverse=True)
+        anchor = None
+        for sym in syms:
+            if wins and _scan_sym(sym, wins):
+                continue
+            if not need_fallback:
+                continue
+            fallback = (
+                ((max(fnstart, anchor - 0x20000), min(fnend, anchor + 0x20000)), (fnstart, fnend))
+                if anchor is not None else ((fnstart, fnend),)
+            )
+            if _scan_sym(sym, fallback) and anchor is None:
+                for noff, s_val in wanted_nameoffs.items():
+                    if s_val == sym:
+                        anchor = fnstart + noff
+                        break
+
+    if not wanted_nameoffs:
+        return build_functions(data, target_names=None)
+
+    first_foff = u32(data, pcln + 4)[0]
+    last_foff = u32(data, pcln + (nfunc - 1) * 8 + 4)[0]
+    rec_min = pcln + first_foff
+    rec_max = min(len(data), pcln + last_foff + 64)
+
+    matched_by_idx = {}
+    for nameoff, sym in wanted_nameoffs.items():
+        packed = struct.pack("<i", nameoff)
+        lo, hi = 0, nfunc - 1
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            m_foff = u32(data, pcln + mid * 8 + 4)[0]
+            m_noff = i32(data, pcln + m_foff + 4)[0]
+            if m_noff < nameoff:
+                lo = mid + 1
+            else:
+                hi = mid
+        center_foff = u32(data, pcln + lo * 8 + 4)[0]
+        w_lo = max(rec_min, pcln + center_foff - 0x40000)
+        w_hi = min(rec_max, pcln + center_foff + 0x40000)
+
+        for r_lo, r_hi in ((w_lo, w_hi), (rec_min, rec_max)):
+            found_rec = False
+            pos = r_lo
+            while True:
+                hit = data.find(packed, pos, r_hi)
+                if hit < 0:
+                    break
+                r_off = hit - 4
+                funcoff = r_off - pcln
+                eoff_cand = u32(data, r_off)[0]
+                flo, fhi = 0, nfunc - 1
+                while flo <= fhi:
+                    fmid = (flo + fhi) >> 1
+                    ke, kf = u32_pair(data, pcln + fmid * 8)
+                    if kf < funcoff:
+                        flo = fmid + 1
+                    elif kf > funcoff:
+                        fhi = fmid - 1
+                    else:
+                        if ke == eoff_cand and pcln + (fmid + 1) * 8 + 4 <= len(data):
+                            ne = u32(data, pcln + (fmid + 1) * 8)[0]
+                            matched_by_idx[fmid] = (sym, ke, max(0, ne - ke))
+                            found_rec = True
+                        break
+                pos = hit + 1
+            if found_rec:
+                break
+
+    if not matched_by_idx:
+        return build_functions(data, target_names=None)
+
+    funcs = {}
+    for idx in sorted(matched_by_idx):
+        sym, ke, sz = matched_by_idx[idx]
+        funcs.setdefault(sym, (ke, sz))
     return funcs
 
 
@@ -1068,6 +1316,464 @@ def patch_env(data, funcs, text_va, text_off, arch):
 
 
 # --------------------------------------------------------------------------
+# Gate 5: agy_hub_web_bundle.GetFS (Hub Desktop UI: Context Ring + Selector)
+# --------------------------------------------------------------------------
+
+HUB_UI_MARKER = "/*AGY_HUB_CTX_UI_V1*/"
+
+
+def _slice_around(js, anchor, before=400, after=2200):
+    idx = js.find(anchor)
+    if idx < 0:
+        raise PatchError(f"Hub UI: anchor {anchor!r} not found in main.js")
+    return js[max(0, idx - before):min(len(js), idx + after)]
+
+
+def _resolve_hub_js_idents(js):
+    """Dynamically resolve minified React & UI component identifiers in ~5 ms using local windows."""
+    win_er = _slice_around(js, ".contextWindow?.EffortRow", 400, 2200)
+    m_ms = re.search(
+        r'var \{setSelectedModel:[A-Za-z0-9_$]+,selectedModel:[A-Za-z0-9_$]+,'
+        r'bestOfNConfig:[A-Za-z0-9_$]+,effortIndex:[A-Za-z0-9_$]+,'
+        r'contextWindow:[A-Za-z0-9_$]+\}=([A-Za-z0-9_$]+)\(\)',
+        win_er,
+    )
+    m_menu = re.search(
+        r'([A-Za-z0-9_$]+)\.createElement\(([A-Za-z0-9_$]+),\{title:[A-Za-z0-9_$]+\.base\},\s*'
+        r'\1\.createElement\(([A-Za-z0-9_$]+),\{selected:.*?'
+        r'\1\.createElement\("span",\{"data-testid":"model-selector-effort-group".*?([A-Za-z0-9_$]+)\[[A-Za-z0-9_$]+\]\).*?'
+        r'\1\.createElement\(([A-Za-z0-9_$]+),\{side:"right",align:"start".*?'
+        r'\.contextWindowOptions\?\.length\?\1\.createElement\([A-Za-z0-9_$]+,\{key:[A-Za-z0-9_$]+,option:[A-Za-z0-9_$]+,effort:[A-Za-z0-9_$]+,selected:[A-Za-z0-9_$]+,contextWindow:[A-Za-z0-9_$]+\}\):'
+        r'\1\.createElement\(([A-Za-z0-9_$]+),\{key:',
+        win_er, re.S,
+    )
+    win_cws = _slice_around(js, '.get("contextWindowSelector")', 120, 3600)
+    m_hkb = re.search(
+        r'function ([A-Za-z0-9_$]+)\(a,b\)\{var c=[A-Za-z0-9_$]+\(\)\.get\("contextWindowSelector"\)\?\.enabled',
+        win_cws,
+    )
+    m_seg = re.search(
+        r'([A-Za-z0-9_$]+)="var\(--chart-blue.*?'
+        r'([A-Za-z0-9_$]+)=\(\{segments:a,pct:b,heightClass:c="h-2"\}\)=>.*?'
+        r'([A-Za-z0-9_$]+)=\(\{segments:a,groups:b,truncatedGroups:c',
+        win_cws, re.S,
+    )
+    win_sb = _slice_around(js, "Removing the message from the queue", 600, 100)
+    m_sb = re.search(
+        r'([A-Za-z0-9_$]+)\([A-Za-z0-9_$]+,\{selector:[A-Za-z0-9_$]+,equalityFn:([A-Za-z0-9_$]+)\}\)\?\?\[\]',
+        win_sb,
+    )
+    win_usage = _slice_around(js, '"View Usage"', 600, 600)
+    m_usage = re.search(
+        r'createElement\(([A-Za-z0-9_$]+),null\),[A-Za-z0-9_$]+\.createElement\("div",\{className:"flex flex-col gap-0\.5"\}.*?'
+        r'"View Usage".*?createElement\([A-Za-z0-9_$]+,\{side:"right",align:"start",className:"w-80 max-h-80"\},'
+        r'[A-Za-z0-9_$]+\.createElement\(([A-Za-z0-9_$]+),null\)\)',
+        win_usage, re.S,
+    )
+    win_pop = _slice_around(js, '"model-selector-panel"', 200, 900)
+    m_pop = re.search(
+        r'createElement\(([A-Za-z0-9_$]+),\{open:[A-Za-z0-9_$]+,onOpenChange:[A-Za-z0-9_$]+\},'
+        r'[A-Za-z0-9_$]+\.createElement\("div",\{className:"min-w-0"\},'
+        r'[A-Za-z0-9_$]+\.createElement\(([A-Za-z0-9_$]+),\{asChild:!0\}',
+        win_pop,
+    )
+    win_tip = _slice_around(js, '"Edit Conversation Title"', 200, 100)
+    m_tip = re.search(
+        r'createElement\(([A-Za-z0-9_$]+),\{id:[A-Za-z0-9_$]+,content:"Edit Conversation Title"',
+        win_tip,
+    )
+    missing = [
+        name for name, match in (
+            ("ModelSelectorHook", m_ms),
+            ("EffortMenu", m_menu),
+            ("ContextWindowHook", m_hkb),
+            ("AgentStateSelector", m_sb),
+            ("UsagePanel", m_usage),
+            ("PopoverMenu", m_pop),
+            ("SegmentedBar", m_seg),
+            ("Tooltip", m_tip),
+        ) if match is None
+    ]
+    if missing:
+        raise PatchError(f"Hub UI: unresolved minified identifiers: {', '.join(missing)}")
+
+    R, sub_root, sub_trig, eff_map, menu_pop, menu_item = m_menu.groups()
+    sb_hook, eq_fn = m_sb.groups()
+    menu_sep, usage_panel = m_usage.groups()
+    pop_root, pop_trig = m_pop.groups()
+    palette, seg_bar, grp_tree = m_seg.groups()
+    return {
+        "R": R,
+        "ms_hook": m_ms.group(1),
+        "sub_root": sub_root,
+        "sub_trig": sub_trig,
+        "eff_map": eff_map,
+        "menu_pop": menu_pop,
+        "menu_item": menu_item,
+        "cw_hook": m_hkb.group(1),
+        "sb_hook": sb_hook,
+        "eq_fn": eq_fn,
+        "menu_sep": menu_sep,
+        "usage_panel": usage_panel,
+        "pop_root": pop_root,
+        "pop_trig": pop_trig,
+        "palette": palette,
+        "seg_bar": seg_bar,
+        "grp_tree": grp_tree,
+        "tooltip": m_tip.group(1),
+    }
+
+
+def _build_hub_ui_inject_expr(idmap):
+    R = idmap["R"]
+    return (
+        "(()=>{" + HUB_UI_MARKER
+        + "var _tokFor=n=>n===\"256K\"?256000:n===\"512K\"?512000:n===\"900K\"?900000:0;"
+        + "var _fmtK=n=>n>=1e6?(n/1e6).toFixed(2).replace(/\\.00$/,\"\")+\"M\":n>=1e3?Math.round(n/1e3)+\"K\":String(n);"
+        + "var _EffortRow=({option:a,effort:b,selected:c,contextWindow:d})=>{"
+        + f"var {{setIsOpen:f}}={idmap['ms_hook']}(),g=d?.selected||\"Default\",h=a.contextWindowOptions||[];"
+        + f"return {R}.createElement({idmap['sub_root']},{{title:{idmap['eff_map']}[b]||b}},"
+        + f"{R}.createElement({idmap['sub_trig']},{{selected:c,onClick:()=>{{d.select(a,g);f(!1)}}}},"
+        + f"{R}.createElement(\"span\",{{\"data-testid\":\"model-selector-effort-option\",\"data-effort\":b,className:\"truncate flex-1 text-left\"}},{idmap['eff_map']}[b]||b),"
+        + f"c&&{R}.createElement(\"span\",{{className:\"text-xs opacity-60 ml-2\"}},g)),"
+        + f"{R}.createElement({idmap['menu_pop']},{{side:\"right\",align:\"start\",className:\"min-w-48 p-1\"}},"
+        + f"{R}.createElement(\"div\",{{className:\"text-xs px-2 py-1 text-muted-foreground font-medium\"}},\"上下文窗口\"),"
+        + f"h.map(k=>{{var l=c&&g===k.name;return {R}.createElement({idmap['menu_item']},{{key:k.name,selected:l,description:k.description,onClick:()=>{{d.select(a,k.name);f(!1)}}}},"
+        + f"{R}.createElement(\"span\",{{className:\"flex items-center justify-between gap-2 w-full\"}},"
+        + f"{R}.createElement(\"span\",{{className:\"font-medium\"}},k.name),"
+        + f"k.expensive&&{R}.createElement(\"span\",{{className:\"text-xs text-amber-500\"}},\"高消耗\")))}})))}};"
+        + "var _Indicator=({conversationId:a})=>{"
+        + f"var [b,c]=(0,{R}.useState)(!1),d=(0,{R}.useId)(),"
+        + f"f={idmap['sb_hook']}(a,{{selector:w=>w?.agentState?.contextWindowUsage,equalityFn:{idmap['eq_fn']}}}),"
+        + f"g={idmap['cw_hook']}(a),h=_tokFor(g),k=f?.estimatedTokensUsed??0,"
+        + "l=h>0?h:f?.maxContextTokens||983040,"
+        + "m=l>0?Math.min(k/l,1):0,n=Math.round(m*100),"
+        + "p=2*Math.PI*11,q=p-m*p,"
+        + "t=m>=.85?\"#ef4444\":m>=.65?\"#f59e0b\":\"#22c55e\","
+        + "u=(f?.tokenGroups||[]).filter(w=>w.numTokens>0),"
+        + f"v=u.map((w,x)=>({{label:w.name,tokens:w.numTokens,color:{idmap['palette']}[x%{idmap['palette']}.length],pctValue:l>0?w.numTokens/l*100:0}}));"
+        + f"return {R}.createElement({idmap['pop_root']},{{open:b,onOpenChange:c}},"
+        + f"{R}.createElement({idmap['pop_trig']},{{asChild:!0}},"
+        + f"{R}.createElement(\"button\",{{type:\"button\",\"data-tooltip-id\":d,\"aria-label\":\"上下文与额度\",className:\"flex items-center gap-1 h-7 px-1.5 rounded-full hover:bg-secondary text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer select-none\"}},"
+        + f"{R}.createElement(\"svg\",{{viewBox:\"0 0 28 28\",className:\"w-4 h-4 -rotate-90 shrink-0\"}},"
+        + f"{R}.createElement(\"circle\",{{cx:\"14\",cy:\"14\",r:\"11\",fill:\"none\",stroke:\"currentColor\",strokeOpacity:\"0.22\",strokeWidth:\"2.8\"}}),"
+        + f"{R}.createElement(\"circle\",{{cx:\"14\",cy:\"14\",r:\"11\",fill:\"none\",stroke:t,strokeWidth:\"3\",strokeDasharray:p,strokeDashoffset:q,strokeLinecap:\"round\"}})),"
+        + f"{R}.createElement(\"span\",{{className:\"tabular-nums\"}},k>0?_fmtK(k)+\"/\"+_fmtK(l):g===\"Default\"?\"1M\":g))),"
+        + f"!b&&{R}.createElement({idmap['tooltip']},{{id:d,place:\"top\"}},\"上下文: \"+k.toLocaleString()+\" / \"+l.toLocaleString()+\" tokens (\"+n+\"%) · 档位: \"+(g===\"Default\"?\"默认 1M\":g)),"
+        + f"{R}.createElement({idmap['menu_pop']},{{side:\"top\",align:\"end\",offset:6,className:\"w-80 p-3 flex flex-col gap-3\"}},"
+        + f"{R}.createElement(\"div\",{{className:\"flex flex-col gap-1.5\"}},"
+        + f"{R}.createElement(\"div\",{{className:\"flex items-center justify-between text-sm\"}},"
+        + f"{R}.createElement(\"span\",{{className:\"font-medium text-foreground\"}},\"上下文窗口 (\"+(g===\"Default\"?\"已解锁 1M\":g)+\")\"),"
+        + f"{R}.createElement(\"span\",{{className:\"tabular-nums text-muted-foreground\"}},k.toLocaleString()+\" / \"+l.toLocaleString()+\" (\"+n+\"%)\")),"
+        + f"v.length>0&&{R}.createElement({idmap['seg_bar']},{{segments:v,pct:w=>l>0?w/l*100:0}}),"
+        + f"v.length>0&&{R}.createElement({idmap['grp_tree']},{{segments:v,groups:u,showPct:!0,hideBreakdownForGroups:[]}})),"
+        + f"{R}.createElement({idmap['menu_sep']},null),"
+        + f"{R}.createElement({idmap['usage_panel']},null)))}};"
+        + "return{contextUsageIndicator:{Indicator:_Indicator},contextWindow:{EffortRow:_EffortRow}}})()"
+    )
+
+
+def _va_to_file_off(data, va):
+    if data[:2] == b"MZ":
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        nsec = struct.unpack_from("<H", data, pe + 6)[0]
+        opt_size = struct.unpack_from("<H", data, pe + 20)[0]
+        opt = pe + 24
+        image_base = struct.unpack_from("<Q", data, opt + 24)[0]
+        rva = va - image_base
+        sect = opt + opt_size
+        for _ in range(nsec):
+            vsz, sva, raw_sz, raw_off = struct.unpack_from("<IIII", data, sect + 8)
+            if sva <= rva < sva + raw_sz:
+                return raw_off + (rva - sva)
+            sect += 40
+        return None
+    if data[:4] == b"\xcf\xfa\xed\xfe":
+        ncmds = struct.unpack_from("<I", data, 16)[0]
+        off = 32
+        for _ in range(ncmds):
+            cmd, size = struct.unpack_from("<II", data, off)
+            if cmd == 0x19:
+                vmaddr, vmsize, fileoff, filesize = struct.unpack_from("<QQQQ", data, off + 24)
+                if vmaddr <= va < vmaddr + filesize:
+                    return fileoff + (va - vmaddr)
+            off += size
+        return None
+    if data[:4] == b"\x7fELF":
+        phoff = struct.unpack_from("<Q", data, 32)[0]
+        phentsize, phnum = struct.unpack_from("<HH", data, 54)
+        for i in range(phnum):
+            ph = phoff + i * phentsize
+            if struct.unpack_from("<I", data, ph)[0] != 1:
+                continue
+            p_offset, p_vaddr, _p_paddr, p_filesz = struct.unpack_from("<QQQQ", data, ph + 8)
+            if p_vaddr <= va < p_vaddr + p_filesz:
+                return p_offset + (va - p_vaddr)
+    return None
+
+
+def _locate_embedded_hub_zip(data, funcs, text_va, text_off, arch):
+    """Return (zip_file_off, zip_orig_cap, len_global_offs) from agy_hub_web_bundle.GetFS."""
+    if FUNC_HUB_WEB_BUNDLE not in funcs:
+        return None
+    entryoff, size = funcs[FUNC_HUB_WEB_BUNDLE]
+    fn_off = text_off + entryoff
+    fn_va = text_va + entryoff
+    body = bytes(data[fn_off:fn_off + (size or 0xE0)])
+
+    global_vas = set()
+    if arch == "x86-64":
+        for i in range(len(body) - 7):
+            if body[i] in (0x48, 0x4C) and body[i + 1] == 0x8B and (body[i + 2] & 0xC7) == 0x05:
+                disp = struct.unpack_from("<i", body, i + 3)[0]
+                global_vas.add(fn_va + i + 7 + disp)
+    elif arch == "arm64":
+        for i in range(0, len(body) - 8, 4):
+            w0, w1 = struct.unpack_from("<II", body, i)
+            if (w0 & 0x9F000000) == 0x90000000 and (w1 & 0xFFC00000) == 0xF9400000:
+                rd = w0 & 0x1F
+                rn = (w1 >> 5) & 0x1F
+                if rd == rn:
+                    immlo = (w0 >> 29) & 3
+                    immhi = (w0 >> 5) & 0x7FFFF
+                    imm = (immhi << 2) | immlo
+                    if imm & (1 << 20):
+                        imm -= 1 << 21
+                    page = ((fn_va + i) & ~0xFFF) + (imm << 12)
+                    off12 = ((w1 >> 10) & 0xFFF) * 8
+                    global_vas.add(page + off12)
+
+    for gva in sorted(global_vas):
+        # A Go slice header is {Data uintptr, Len int, Cap int} (24 bytes)
+        hdr_fo = _va_to_file_off(data, gva)
+        if hdr_fo is None or hdr_fo + 24 > len(data):
+            continue
+        ptr_va, sl_len, sl_cap = struct.unpack_from("<QQQ", data, hdr_fo)
+        if not (0x10000 < sl_len <= sl_cap < 0x10000000):
+            continue
+        zip_fo = _va_to_file_off(data, ptr_va)
+        if zip_fo is None or zip_fo + sl_cap > len(data):
+            continue
+        if data[zip_fo:zip_fo + 4] == b"PK\x03\x04":
+            return zip_fo, sl_len, sl_cap, hdr_fo + 8
+    return None
+
+
+def _transform_hub_main_js(js):
+    """Unlock Context Usage Indicator ring & Context Window tier selector in Hub UI main.js."""
+    if HUB_UI_MARKER in js:
+        return None
+
+    # 1. Enable contextWindowSelector feature for external cohort too (no customFlag needed)
+    old_cws = (
+        'contextWindowSelector:{feature:{enabled:!1},applyAll:[{runtimeGating:'
+        '{customFlag:"context-window-selector",userCohort:["google"]},feature:{enabled:!0}}]}'
+    )
+    new_cws = 'contextWindowSelector:{feature:{enabled:!0},applyAll:[]}'
+    if old_cws not in js:
+        raise PatchError("Hub UI: contextWindowSelector gate pattern not found")
+    js = js.replace(old_cws, new_cws, 1)
+
+    # 2. Enable contextUsageIndicator by default unless in cli-hosted-session
+    w2_idx = js.find("contextUsageIndicator:{feature:!1")
+    if w2_idx < 0:
+        raise PatchError("Hub UI: contextUsageIndicator gate anchor not found")
+    w2_end = min(len(js), w2_idx + 240)
+    seg2, n1 = re.subn(
+        r'contextUsageIndicator:\{feature:!1,applyAll:\[\{runtimeGating:\{customFlag:"enable-context-usage-indicator"\},\s*feature:!0\},',
+        'contextUsageIndicator:{feature:!0,applyAll:[',
+        js[w2_idx:w2_end],
+        count=1,
+    )
+    if n1 != 1:
+        raise PatchError("Hub UI: contextUsageIndicator gate pattern not found")
+    js = js[:w2_idx] + seg2 + js[w2_end:]
+
+    # 3. Make Context and Quota Indicator toggle visible in Appearance Settings
+    w3_idx = js.find("contextUsageIndicatorEnabled:{feature:{visible:!1}")
+    if w3_idx < 0:
+        raise PatchError("Hub UI: contextUsageIndicatorEnabled settings anchor not found")
+    w3_end = min(len(js), w3_idx + 240)
+    seg3, n2 = re.subn(
+        r'contextUsageIndicatorEnabled:\{feature:\{visible:!1\},applyAll:\[\{runtimeGating:\{customFlag:"enable-context-usage-indicator"\},\s*feature:\{visible:!0\}\}\]',
+        'contextUsageIndicatorEnabled:{feature:{visible:!0},applyAll:[]',
+        js[w3_idx:w3_end],
+        count=1,
+    )
+    if n2 != 1:
+        raise PatchError("Hub UI: contextUsageIndicatorEnabled settings gate not found")
+    js = js[:w3_idx] + seg3 + js[w3_end:]
+
+    # 4. Populate Default / 256K / 512K / 900K options when server omits contextWindowOptions
+    default_opts = (
+        '[{name:"Default",description:"已解锁完整物理上下文窗口 (~1M tokens)"},'
+        '{name:"256K",description:"256,000 tokens (标准 1.0x 消耗)"},'
+        '{name:"512K",description:"512,000 tokens (推荐甜点档位)"},'
+        '{name:"900K",description:"900,000 tokens (近极限大窗口)",expensive:!0}]'
+    )
+    w4_idx = js.find("contextWindowOptions:a.contextWindowOptions.length?")
+    if w4_idx < 0:
+        raise PatchError("Hub UI: Kpa contextWindowOptions anchor not found")
+    w4_end = min(len(js), w4_idx + 260)
+    seg4, n3 = re.subn(
+        r'contextWindowOptions:a\.contextWindowOptions\.length\?\s*a\.contextWindowOptions\.map\(\(\{name:b,description:c,expensive:d\}\)=>\(\{name:b,description:c\|\|void 0,expensive:d\|\|void 0\}\)\):void 0',
+        f'contextWindowOptions:a.contextWindowOptions.length?a.contextWindowOptions.map(({{name:b,description:c,expensive:d}})=>({{name:b,description:c||void 0,expensive:d||void 0}})):{default_opts}',
+        js[w4_idx:w4_end],
+        count=1,
+    )
+    if n3 != 1:
+        raise PatchError("Hub UI: Kpa contextWindowOptions mapper not found")
+    js = js[:w4_idx] + seg4 + js[w4_end:]
+
+    # 4b. Also render Indicator on empty new-chat composer before first message
+    w4b_idx = js.find("contextUsageIndicator:")
+    while w4b_idx >= 0:
+        chunk4b = js[w4b_idx:w4b_idx + 140]
+        m4b = re.match(
+            r'contextUsageIndicator:([A-Za-z0-9_$]+)&&([A-Za-z0-9_$]+)&&([A-Za-z0-9_$]+)\?([A-Za-z0-9_$]+)\.createElement\(\1,\{conversationId:\3\}\):void 0',
+            chunk4b,
+        )
+        if m4b:
+            s_comp, s_en, s_cid, s_R = m4b.groups()
+            repl4b = f'contextUsageIndicator:{s_comp}&&{s_en}?{s_R}.createElement({s_comp},{{conversationId:{s_cid}}}):void 0'
+            js = js[:w4b_idx] + repl4b + js[w4b_idx + len(m4b.group(0)):]
+            break
+        w4b_idx = js.find("contextUsageIndicator:", w4b_idx + 22)
+
+    # 5. Map selected tier to CheckpointConfig.maxTokenLimit so LS enforces 256K/512K/900K/1M cleanly
+    idx_cp = js.find("CheckpointConfigSchema,{contextWindow:")
+    if idx_cp < 0:
+        raise PatchError("Hub UI: JS() checkpointConfig builder not found")
+    s_lo, s_hi = max(0, idx_cp - 60), min(len(js), idx_cp + 120)
+    seg_cp, n4 = re.subn(
+        r'checkpointConfig:([A-Za-z0-9_$]+)\?([A-Za-z0-9_$]+)\(([A-Za-z0-9_$]+\.CheckpointConfigSchema),\{contextWindow:\1\}\):void 0',
+        r'checkpointConfig:\1==="256K"?\2(\3,{maxTokenLimit:256000}):\1==="512K"?\2(\3,{maxTokenLimit:512000}):\1==="900K"?\2(\3,{maxTokenLimit:900000}):void 0',
+        js[s_lo:s_hi],
+        count=1,
+    )
+    if n4 != 1:
+        raise PatchError("Hub UI: JS() checkpointConfig builder pattern mismatch")
+    js = js[:s_lo] + seg_cp + js[s_hi:]
+
+    idx_cp2 = js.find("CheckpointConfigSchema,{contextWindow:", idx_cp + 100)
+    if idx_cp2 >= 0:
+        s2_lo, s2_hi = max(0, idx_cp2 - 80), min(len(js), idx_cp2 + 120)
+        seg_cp2 = re.sub(
+            r'b\.checkpointConfig=([A-Za-z0-9_$]+)!==void 0\?([A-Za-z0-9_$]+)\(([A-Za-z0-9_$]+\.CheckpointConfigSchema),\{contextWindow:\1\}\):void 0',
+            r'b.checkpointConfig=\1==="256K"?\2(\3,{maxTokenLimit:256000}):\1==="512K"?\2(\3,{maxTokenLimit:512000}):\1==="900K"?\2(\3,{maxTokenLimit:900000}):void 0',
+            js[s2_lo:s2_hi],
+            count=1,
+        )
+        js = js[:s2_lo] + seg_cp2 + js[s2_hi:]
+
+    # 6. Inject Indicator & EffortRow components into buildBindings bootstrap
+    idmap = _resolve_hub_js_idents(js)
+    inject_expr = _build_hub_ui_inject_expr(idmap)
+    old_bind = 'contextUsageIndicator:void 0,contextWindow:void 0,'
+    new_bind = f'...{inject_expr},'
+    if old_bind not in js:
+        raise PatchError("Hub UI: buildBindings contextUsageIndicator/contextWindow slot not found")
+    js = js.replace(old_bind, new_bind, 1)
+
+    return js
+
+
+def _fast_replace_zip_member(zip_bytes, target_name, new_raw_bytes, compresslevel=9):
+    """Rebuild ZIP copying raw compressed streams for untouched entries and recompressing only target_name."""
+    zin = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
+    raw_view = memoryview(zip_bytes)
+    out = io.BytesIO()
+    central_dir = []
+
+    for info in zin.infolist():
+        lhdr_off = info.header_offset
+        sig, ver, flags, comp_method, mtime, mdate, crc, csize, usize, fn_len, ex_len = struct.unpack_from(
+            "<4sHHHHHIIIHH", raw_view, lhdr_off
+        )
+        if sig != b"PK\x03\x04":
+            raise PatchError(f"Hub UI ZIP: bad local header signature at {lhdr_off:#x}")
+        fn_bytes = bytes(raw_view[lhdr_off + 30:lhdr_off + 30 + fn_len])
+        extra_bytes = bytes(raw_view[lhdr_off + 30 + fn_len:lhdr_off + 30 + fn_len + ex_len])
+        data_start = lhdr_off + 30 + fn_len + ex_len
+
+        if info.filename == target_name:
+            usize = len(new_raw_bytes)
+            crc = zlib.crc32(new_raw_bytes) & 0xFFFFFFFF
+            cobj = zlib.compressobj(compresslevel, zlib.DEFLATED, -zlib.MAX_WBITS)
+            comp_payload = cobj.compress(new_raw_bytes) + cobj.flush()
+            csize = len(comp_payload)
+            comp_method = zipfile.ZIP_DEFLATED
+            flags &= ~0x08
+        else:
+            comp_payload = raw_view[data_start:data_start + info.compress_size]
+            crc = info.CRC
+            csize = info.compress_size
+            usize = info.file_size
+            flags &= ~0x08
+
+        new_lhdr_off = out.tell()
+        out.write(struct.pack(
+            "<4sHHHHHIIIHH",
+            b"PK\x03\x04", ver, flags, comp_method, mtime, mdate,
+            crc, csize, usize, len(fn_bytes), len(extra_bytes),
+        ))
+        out.write(fn_bytes)
+        out.write(extra_bytes)
+        out.write(comp_payload)
+
+        cd_hdr = struct.pack(
+            "<4sHHHHHHIIIHHHHHII",
+            b"PK\x01\x02", info.create_version, info.extract_version, flags,
+            comp_method, mtime, mdate, crc, csize, usize,
+            len(fn_bytes), len(info.extra), len(info.comment),
+            0, info.internal_attr, info.external_attr, new_lhdr_off,
+        )
+        central_dir.append(cd_hdr + fn_bytes + info.extra + info.comment)
+
+    cd_start = out.tell()
+    for cd in central_dir:
+        out.write(cd)
+    cd_size = out.tell() - cd_start
+    out.write(struct.pack(
+        "<4sHHHHIIH",
+        b"PK\x05\x06", 0, 0, len(central_dir), len(central_dir), cd_size, cd_start, 0,
+    ))
+    return out.getvalue()
+
+
+def patch_gate5_hub_ui(data, funcs, text_va, text_off, arch):
+    loc = _locate_embedded_hub_zip(data, funcs, text_va, text_off, arch)
+    if loc is None:
+        return False, f"[Gate 5] {FUNC_HUB_WEB_BUNDLE}: embedded UI archive not present, skipped"
+    zip_fo, zip_len, zip_cap, len_field_fo = loc
+    zip_bytes = bytes(data[zip_fo:zip_fo + zip_len])
+    try:
+        zin = zipfile.ZipFile(io.BytesIO(zip_bytes), "r")
+        if "main.js" not in zin.namelist():
+            return False, f"[Gate 5] {FUNC_HUB_WEB_BUNDLE}: main.js not in bundle, skipped"
+        orig_js = zin.read("main.js").decode("utf-8")
+    except Exception as exc:
+        raise PatchError(f"Hub UI ZIP read failed: {exc}") from exc
+
+    new_js = _transform_hub_main_js(orig_js)
+    if new_js is None:
+        return False, f"[Gate 5] {FUNC_HUB_WEB_BUNDLE}: already patched"
+
+    new_zip = _fast_replace_zip_member(zip_bytes, "main.js", new_js.encode("utf-8"), compresslevel=9)
+    if len(new_zip) > zip_cap:
+        raise PatchError(f"Hub UI ZIP repack ({len(new_zip)} B) exceeds slice cap ({zip_cap} B)")
+
+    data[zip_fo:zip_fo + len(new_zip)] = new_zip
+    if len(new_zip) < zip_cap:
+        data[zip_fo + len(new_zip):zip_fo + zip_cap] = b"\x00" * (zip_cap - len(new_zip))
+    struct.pack_into("<Q", data, len_field_fo, len(new_zip))
+    return True, (
+        f"[Gate 5] {FUNC_HUB_WEB_BUNDLE}: unlocked Hub UI Context Ring + "
+        f"[Default/256K/512K/900K] Selector (zip {zip_len} -> {len(new_zip)} B)"
+    )
+
+
+# --------------------------------------------------------------------------
 # Signing & atomic write
 # --------------------------------------------------------------------------
 
@@ -1187,8 +1893,69 @@ def _running_pids_for_binary(src):
     return [p for p in running.stdout.split() if p != str(os.getpid())]
 
 
+def _cleanup_stale_running_old(dst):
+    """Best-effort removal of unlocked <dst>.running.old* files from prior Windows swaps."""
+    dst_dir = os.path.dirname(dst) or "."
+    prefix = os.path.basename(dst) + ".running.old"
+    try:
+        entries = os.listdir(dst_dir)
+    except OSError:
+        return
+    for name in entries:
+        if name == prefix or name.startswith(prefix + "."):
+            try:
+                os.unlink(os.path.join(dst_dir, name))
+            except OSError:
+                pass
+
+
+def _replace_atomic_or_hotswap(tmp, dst):
+    """Atomically place `tmp` at `dst`, parking a running Windows PE as `.running.old`."""
+    if sys.platform == "win32":
+        _cleanup_stale_running_old(dst)
+
+    try:
+        os.replace(tmp, dst)
+        return None
+    except PermissionError as orig_exc:
+        if sys.platform != "win32" or not os.path.exists(dst):
+            raise
+
+        pid = os.getpid()
+        candidates = [f"{dst}.running.old", f"{dst}.running.old.{pid}"]
+        candidates.extend(f"{dst}.running.old.{pid}.{n}" for n in range(1, 8))
+
+        parked = None
+        for cand in candidates:
+            if os.path.exists(cand):
+                try:
+                    os.unlink(cand)
+                except OSError:
+                    continue
+            try:
+                os.replace(dst, cand)
+                parked = cand
+                break
+            except OSError:
+                continue
+
+        if parked is None:
+            raise orig_exc
+
+        try:
+            os.replace(tmp, dst)
+        except Exception:
+            if not os.path.exists(dst) and os.path.exists(parked):
+                try:
+                    os.replace(parked, dst)
+                except OSError:
+                    pass
+            raise
+        return parked
+
+
 def write_atomic_signed(dst, data, src_for_entitlements=None, make_backup=False):
-    """Write to a fresh inode, sign, then os.replace() to refresh macOS cs_blob cache."""
+    """Write to a fresh inode, sign, then os.replace() (with Windows hot-swap fallback)."""
     _strip_pe_authenticode(data)
     ent_xml = _extract_adhoc_safe_entitlements(src_for_entitlements or dst)
     ident = _extract_identifier(src_for_entitlements or dst)
@@ -1199,13 +1966,14 @@ def write_atomic_signed(dst, data, src_for_entitlements=None, make_backup=False)
             print(f"[i] saved backup: {bak}")
 
     tmp = f"{dst}.tmp.{os.getpid()}"
+    parked_old = None
     try:
         with open(tmp, "wb") as fh:
             fh.write(data)
         os.chmod(tmp, 0o755)
         resign(tmp, entitlements_xml=ent_xml, identifier=ident)
         try:
-            os.replace(tmp, dst)
+            parked_old = _replace_atomic_or_hotswap(tmp, dst)
         except PermissionError as exc:
             raise PatchError(
                 f"cannot overwrite {dst} ({exc.strerror or 'access denied'}); "
@@ -1213,9 +1981,15 @@ def write_atomic_signed(dst, data, src_for_entitlements=None, make_backup=False)
             ) from exc
     except Exception:
         if os.path.exists(tmp):
-            os.unlink(tmp)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise
 
+    if parked_old:
+        print(f"[i] hot-swap: parked running binary at {parked_old} "
+              f"(restart {os.path.basename(dst)} to load patched image)")
     if ident:
         print(f"[i] signature: identifier preserved as {ident!r}")
     if sys.platform == "darwin" and ".app/Contents/" in dst:
@@ -1234,11 +2008,13 @@ def main():
             reconf(encoding="utf-8", errors="replace")
 
     ap = argparse.ArgumentParser(
-        description="Unlock all context-window gates (4A/4B) in the agy CLI."
+        description="Unlock all context-window gates (1-5) in agy CLI & Antigravity Hub."
     )
     ap.add_argument("--binary", default=_default_binary_path())
     ap.add_argument("--no-env-fix", action="store_true",
                     help="skip optional AGY_CLI_AUTO_COMPACT_OVERRIDE restore")
+    ap.add_argument("--no-hub-ui", action="store_true",
+                    help="skip Gate 5 Hub Desktop UI Context Ring & Selector unlock")
     ap.add_argument("--no-backup", action="store_true",
                     help="skip creating <binary>.bak on --in-place")
     ap.add_argument("--dry-run", action="store_true")
@@ -1256,15 +2032,19 @@ def main():
 
     pids = _running_pids_for_binary(src)
     if pids:
-        print(f"[!] {len(pids)} process(es) are running this binary "
-              f"(pid {', '.join(pids[:5])}); quit them first or replacing / "
-              f"reloading the binary may fail")
+        if sys.platform == "win32":
+            print(f"[i] {len(pids)} process(es) are running this binary "
+                  f"(pid {', '.join(pids[:5])}); Windows hot-swap will park the active image")
+        else:
+            print(f"[!] {len(pids)} process(es) are running this binary "
+                  f"(pid {', '.join(pids[:5])}); quit them first or replacing / "
+                  f"reloading the binary may fail")
 
     text_va, text_off, arch = find_text_section(data)
-    funcs = build_functions(bytes(data))
+    funcs = build_functions(data, target_names=TARGET_SYMBOLS)
     print(f"[i] binary : {src}")
     print(f"[i] target : arch={arch} text_va={text_va:#x} text_off={text_off:#x} "
-          f"symbols={len(funcs)}")
+          f"matched_symbols={len(funcs)}")
 
     inspect_syms = (
         FUNC_OFFERS,
@@ -1274,6 +2054,7 @@ def main():
         FUNC_EXP_CHECKPOINT,
         FUNC_MAX_STEP_TOKENS,
         FUNC_ONEHARNESS_STEP,
+        FUNC_HUB_WEB_BUNDLE,
         FUNC_OVERRIDE,
         "strings.TrimSpace",
         "os.Getenv",
@@ -1297,22 +2078,24 @@ def main():
             f"https://antigravity.google/docs/install?tab=cli"
         )
     if is_server_only:
-        print("[i] mode   : standalone language_server (Gate 3A/3B + Gate 4A/4B)")
-        patch_pipeline = (
+        print("[i] mode   : standalone language_server (Gate 3A/3B + Gate 4A/4B + Gate 5 Hub UI)")
+        patch_pipeline = [
             patch_gate3a_checkpoint,
             patch_gate3b_exp_checkpoint,
             patch_gate4a_user_input_step,
             patch_gate4b_oneharness_user_input,
-        )
+        ]
     else:
-        patch_pipeline = (
+        patch_pipeline = [
             patch_gate1_ui,
             patch_gate2_store,
             patch_gate3a_checkpoint,
             patch_gate3b_exp_checkpoint,
             patch_gate4a_user_input_step,
             patch_gate4b_oneharness_user_input,
-        )
+        ]
+    if not args.no_hub_ui:
+        patch_pipeline.append(patch_gate5_hub_ui)
 
     for patch_fn in patch_pipeline:
         changed, msg = patch_fn(data, funcs, text_va, text_off, arch)
@@ -1325,7 +2108,7 @@ def main():
         except PatchError as exc:
             print(f"[!] skipped optional env-var patch: {exc}")
 
-    after = hashlib.sha256(bytes(data)).hexdigest()
+    after = hashlib.sha256(data).hexdigest()
     if before == after:
         print("[=] all gates already unlocked; nothing to write")
         return
@@ -1340,7 +2123,8 @@ def main():
         src_for_entitlements=src,
         make_backup=(args.in_place and not args.no_backup),
     )
-    final_sha = hashlib.sha256(open(dst, "rb").read()).hexdigest()
+    with open(dst, "rb") as fh:
+        final_sha = hashlib.sha256(fh.read()).hexdigest()
     print(f"[*] wrote  : {dst}\n    sha256 : {before[:12]} -> {final_sha[:12]}")
 
 

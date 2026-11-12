@@ -53,6 +53,10 @@ python agy-patch.py `
 
 桌面端下次启动后使用新二进制。
 
+> **如何显示桌面端 UI 用量环与档位切换（2.31.2+ 新版必看）**：
+> 1. 重启 Antigravity 桌面端后，打开设置 `Settings` → `Appearance` → `Chat Layout`，开启 **`Context and Quota Indicator`** 开关，聊天框右下角发送按钮旁即会显示彩色上下文用量环（Pill）与分段占用明细；悬停模型思考档位右侧可切换 `Default (~1M) / 256K / 512K / 900K`。
+> 2. <sub>注：为什么需要通过 Gate 5 解锁并在 Appearance 手动开启？因为新版 Antigravity (2.31.2+) 将旧版顶部的上下文用量条移到了右下角发送按钮旁，并在外部发行版中默认裁掉了 `contextUsageIndicator` 与 `contextWindow` 前端挂载点及设置项开关；补丁重新注入了这些组件与开关，开启后即可恢复显示。</sub>
+
 ## 升级后自动再解锁（macOS）
 
 Windows / Linux 下使用 DSH 插件时，插件自带的 `autoPatch` 会在每次启动 `agy acp` 前自动检查并补打补丁。
